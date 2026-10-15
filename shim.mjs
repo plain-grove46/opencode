@@ -43,6 +43,36 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
+async function askOpenCode(model, prompt) {
+  const session = await oc("/session", "POST", {});
+  try {
+    const answer = await oc(`/session/${session.id}/message`, "POST", {
+      model: { providerID: "opencode", modelID: model },
+      parts: [{ type: "text", text: prompt }],
+    });
+    return (answer.parts || [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text)
+      .join("\n");
+  } finally {
+    oc(`/session/${session.id}`, "DELETE").catch(() => {});
+  }
+}
+
+function sseChunk(id, created, model, delta, finishReason) {
+  return (
+    "data: " +
+    JSON.stringify({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model,
+      choices: [{ index: 0, delta, finish_reason: finishReason }],
+    }) +
+    "\n\n"
+  );
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url === "/v1/models") {
@@ -63,36 +93,54 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(raw || "{}");
       const model = body.model || MODEL_ID;
       const prompt = messagesToPrompt(body.messages);
+      const now = Math.floor(Date.now() / 1000);
+      const cid = "chatcmpl-" + now;
 
-      const session = await oc("/session", "POST", {});
-      try {
-        const answer = await oc(`/session/${session.id}/message`, "POST", {
-          model: { providerID: "opencode", modelID: model },
-          parts: [{ type: "text", text: prompt }],
+      if (body.stream) {
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
         });
-        const text = (answer.parts || [])
-          .filter((p) => p.type === "text")
-          .map((p) => p.text)
-          .join("\n");
-        const now = Math.floor(Date.now() / 1000);
-        return sendJson(res, 200, {
-          id: "chatcmpl-" + now,
-          object: "chat.completion",
-          created: now,
-          model,
-          choices: [
-            { index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" },
-          ],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
-      } finally {
-        oc(`/session/${session.id}`, "DELETE").catch(() => {});
+        res.write(sseChunk(cid, now, model, { role: "assistant" }, null));
+        try {
+          const text = await askOpenCode(model, prompt);
+          for (let i = 0; i < text.length; i += 24) {
+            res.write(
+              sseChunk(cid, now, model, { content: text.slice(i, i + 24) }, null)
+            );
+          }
+          res.write(sseChunk(cid, now, model, {}, "stop"));
+          res.write("data: [DONE]\n\n");
+        } catch (e) {
+          res.write(
+            "data: " + JSON.stringify({ error: String((e && e.message) || e) }) + "\n\n"
+          );
+        }
+        res.end();
+        return;
       }
+
+      const text = await askOpenCode(model, prompt);
+      return sendJson(res, 200, {
+        id: cid,
+        object: "chat.completion",
+        created: now,
+        model,
+        choices: [
+          { index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      });
     }
 
     return sendJson(res, 404, { error: "not found" });
   } catch (e) {
-    return sendJson(res, 500, { error: String((e && e.message) || e) });
+    try {
+      return sendJson(res, 500, { error: String((e && e.message) || e) });
+    } catch {
+      try { res.end(); } catch { /* noop */ }
+    }
   }
 });
 
